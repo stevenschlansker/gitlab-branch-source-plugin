@@ -8,6 +8,7 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.sameInstance;
 
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.Run;
 import hudson.scm.NullSCM;
@@ -16,6 +17,8 @@ import io.jenkins.plugins.gitlabbranchsource.BranchSCMHead;
 import io.jenkins.plugins.gitlabbranchsource.BranchSCMRevision;
 import io.jenkins.plugins.gitlabbranchsource.GitLabSCMSource;
 import io.jenkins.plugins.gitlabbranchsource.GitLabSCMSourceBuilder;
+import io.jenkins.plugins.gitlabbranchsource.GitLabTagSCMHead;
+import io.jenkins.plugins.gitlabbranchsource.MergeRequestSCMHead;
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
@@ -26,6 +29,7 @@ import jenkins.branch.BranchSource;
 import jenkins.plugins.git.GitBranchSCMHead;
 import jenkins.plugins.git.GitSCMSource;
 import jenkins.scm.api.SCMHead;
+import jenkins.scm.api.SCMRevision;
 import jenkins.scm.api.SCMRevisionAction;
 import jenkins.scm.api.SCMSource;
 import jenkins.scm.impl.NullSCMSource;
@@ -35,6 +39,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestExtension;
 import org.mockito.Mockito;
 
 public class GitLabPipelineStatusNotifierOrphanedJobTest {
@@ -72,8 +77,49 @@ public class GitLabPipelineStatusNotifierOrphanedJobTest {
     }
 
     @Test
-    public void warns_on_completion_of_orphaned_branch_job_without_revision() {
+    public void skips_revision_action_without_source_id() {
         WorkflowJob job = orphan(project, gitLabBranchJob(project));
+        SCMRevisionAction unattributed = new SCMRevisionAction(revision());
+
+        assertThat(GitLabPipelineStatusNotifier.getSource(run(job, unattributed)), nullValue());
+        assertThat(
+                GitLabPipelineStatusNotifier.getSource(run(job, unattributed, revisionAction())), sameInstance(source));
+    }
+
+    @Test
+    public void skips_revision_action_of_another_scm() {
+        project.getSourcesList().add(new BranchSource(gitSource()));
+        WorkflowJob job = orphan(project, gitLabBranchJob(project));
+
+        assertThat(GitLabPipelineStatusNotifier.getSource(run(job, revisionAction(gitSource()))), nullValue());
+    }
+
+    @Test
+    public void skips_revision_action_of_source_removed_from_project() {
+        WorkflowJob job = orphan(project, gitLabBranchJob(project));
+        project.getSourcesList().clear();
+
+        assertThat(GitLabPipelineStatusNotifier.getSource(run(job, revisionAction())), nullValue());
+    }
+
+    @Test
+    public void warns_on_completion_of_orphaned_branch_job_without_revision() {
+        assertWarnsOnCompletionWithoutRevision(new BranchSCMHead(BRANCH));
+    }
+
+    @Test
+    public void warns_on_completion_of_orphaned_merge_request_job_without_revision() {
+        assertWarnsOnCompletionWithoutRevision(
+                new MergeRequestSCMHead("MR-1", 1, new BranchSCMHead("main"), null, null, null, null, null, null));
+    }
+
+    @Test
+    public void warns_on_completion_of_orphaned_tag_job_without_revision() {
+        assertWarnsOnCompletionWithoutRevision(new GitLabTagSCMHead("v1.0", 0));
+    }
+
+    private void assertWarnsOnCompletionWithoutRevision(SCMHead head) {
+        WorkflowJob job = orphan(project, branchJob(project, SOURCE_ID, head));
         Run<?, ?> run = run(job);
 
         assertThat(GitLabPipelineStatusNotifier.getSource(run), nullValue());
@@ -108,6 +154,27 @@ public class GitLabPipelineStatusNotifierOrphanedJobTest {
         assertThat(sendNotifications(run(freestyle), true), is(""));
     }
 
+    @Test
+    public void stays_silent_for_null_source_outside_multibranch_project() throws Exception {
+        FreeStyleProject freestyle = j.createFreeStyleProject();
+        assertThat(SCMSource.SourceByItem.findSource(freestyle), instanceOf(NullSCMSource.class));
+
+        assertThat(GitLabPipelineStatusNotifier.getSource(run(freestyle, revisionAction())), nullValue());
+        assertThat(sendNotifications(run(freestyle, revisionAction()), true), is(""));
+    }
+
+    /**
+     * Branch API answers a source lookup only for a job inside a multibranch project. Another
+     * extension may answer with a {@link NullSCMSource} for a job elsewhere.
+     */
+    @TestExtension("stays_silent_for_null_source_outside_multibranch_project")
+    public static class NullSourceForEveryItem extends SCMSource.SourceByItem {
+        @Override
+        public SCMSource getSource(Item item) {
+            return new NullSCMSource();
+        }
+    }
+
     private static GitSCMSource gitSource() {
         GitSCMSource git = new GitSCMSource("https://example.com/repo.git");
         git.setId(GIT_SOURCE_ID);
@@ -133,8 +200,15 @@ public class GitLabPipelineStatusNotifierOrphanedJobTest {
     }
 
     private SCMRevisionAction revisionAction() {
-        return new SCMRevisionAction(
-                source, new BranchSCMRevision(new BranchSCMHead(BRANCH), "0123456789abcdef0123456789abcdef01234567"));
+        return revisionAction(source);
+    }
+
+    private static SCMRevisionAction revisionAction(SCMSource recordedSource) {
+        return new SCMRevisionAction(recordedSource, revision());
+    }
+
+    private static SCMRevision revision() {
+        return new BranchSCMRevision(new BranchSCMHead(BRANCH), "0123456789abcdef0123456789abcdef01234567");
     }
 
     private static Run<?, ?> run(Job<?, ?> job, SCMRevisionAction... actions) {
